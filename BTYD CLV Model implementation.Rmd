@@ -1,0 +1,241 @@
+---
+title: "BTYD CLV Model implementation"
+author: "Nandini Hegde"
+date: "August 3, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Predicting Customer Lifecycle value (CLV) of a customer in a Non-contractual setting using BTYD/BTYDplus models
+
+This is project demontrating the use of BTYD models for predicting future CLV of a customer based on historical transactions and sales value.
+Link to the original paper: https://cran.r-project.org/web/packages/BTYD/vignettes/BTYD-walkthrough.pdf
+
+The BTYDplus package has inbuilt functions and models in addition to the BTYD package. Hence, I will be using it to conduct the analysis
+Link to the reference paper: https://cran.r-project.org/web/packages/BTYDplus/vignettes/BTYDplus-HowTo.pdf
+
+## Model selection in a Non-contractual setting
+
+Pareto-NBD and BG-NBD Models can be used in situations when the the transaction opportunities are continuous and not distinct. This is similar to a 
+e-commerce website or a direct to customer retail shop.However,BG-NBD models assume that a customer does not die dueing period of inactivity which seems counterintuitive especially with respect to repeat transactions.
+
+BG/BB Model on the other hand is used in situations wherein customers have discrete transaction opportunities akin a charity donation or an auction.
+
+
+I will be first demonstrating the application of Pareto-NBD and BG-NBD models on the first dataset which is a an online direct to customer sales dataset
+I will then go on to use a second dataset to demonstrate the BG/BB model
+
+### Data exploration- Retail Dataset
+For the implementation of these models we need an event log constiting of customer id, date/time of transaction,  total sales.
+The dataset used in this example is borrowed from:https://www.kaggle.com/regivm/retailtransactiondata#Retail_Data_Transactions.csv
+
+```{r}
+
+#Importing required libraries
+
+install.packages("BTYDplus")
+install.packages("BTYD")
+
+library("BTYD")
+library("BTYDplus")
+library('data.table')
+library(lubridate)
+
+
+#read in data and format as per package requirements
+retail<-read.csv("Retail_Data_Transactions.csv")
+
+elog<-retail
+#rename columns 
+names(elog)<-c("cust","date","sales")
+elog$date <- as.Date(elog$date, format = "%m/%d/%Y")
+
+#reorder according to date
+elog<-elog[order(elog$cust,elog$date),]
+
+# A snapshot of the data
+head(elog)
+
+#checking the format 
+str(elog)
+
+#Merge transactions for each customer on each date
+elog <- dc.MergeTransactionsOnSameDate(elog)
+
+set.seed(123)
+# plot timing patterns of 30 sampled customers
+plotTimingPatterns(elog, n = 30, T.cal = median(elog$date),
+headers = c("Past", "Future"), title = "")
+
+
+```
+Further on in the analysis, we will divide the dataset into holdout and caliberation period based on the median date ("2013-04-14"). This is done to evaluate the accuracy of the model
+
+
+```{r}
+#Calculating Number of repeated transactions by a customer
+n_occur <- data.frame(table(elog$cust))
+head(n_occur,5)
+
+op <- par(mfrow = c(1, 2), mar = c(2.5, 2.5, 2.5, 2.5))
+# incremental weekly transactions total and repetitive
+weekly_inc_total <- elog2inc(elog, by = 7, first = TRUE)
+weekly_inc_repeat <- elog2inc(elog, by = 7, first = FALSE)
+plot(weekly_inc_total, typ = "l", frame = FALSE, main = "Incremental")
+lines(weekly_inc_repeat, col = "red")
+legend(1, 25, legend=c("total transactions", "repeat transactions"),col=c( "black","red"), lty=1, cex=0.8)
+
+# cumulative  weekly transactions total and repetitive
+weekly_cum_total <- elog2cum(elog, by = 7, first = TRUE)
+weekly_cum_repeat <- elog2cum(elog, by = 7, first = FALSE)
+plot(weekly_cum_total, typ = "l", frame = FALSE, main = "Cumulative")
+lines(weekly_cum_repeat, col = "red")
+legend(1, 25, legend=c("total transactions", "repeat transactions"),col=c( "black","red"), lty=1, cex=0.8)
+par(op)
+
+
+```
+The x-axis represents time measured in weeks, thus we see that the customers were observed
+over a five year time period. The gap between the red line (repeat transactions)
+and the black line (total transactions) illustrates the customers’ initial transactions.
+These only occur within the first 75 weeks, perhaps because this dataset was subsetted to include customers acquired in that period.
+
+
+### Data preprocessing- Retail Dataset
+```{r}
+
+# date range
+range(elog$date)
+
+# date median to split holdout and caliberation period
+median(elog$date)
+
+
+#convert to CBS format
+retailCBS <- elog2cbs(elog,T.cal = median(elog$date))
+#remove outliers from the CBS file if any customer has an unnaturally high number of repeat transactions (x) as it can cause error during parameter estimation, this particular dataset had none
+head(retailCBS)
+
+#Estimating regularity
+op <- par(mfrow = c(1, 2))
+(k.wheat <- estimateRegularity(elog, method = "wheat",
+plot = TRUE, title = "Wheat & Morrison"))
+#>[1] 1.037254
+(k.mle <- estimateRegularity(elog, method = "mle",
+plot = TRUE, title = "Maximum Likelihood"))
+#>[1] 1.132881
+par(op)
+
+
+```
+
+Some models are capable of leveraging regularity within transaction timings for improving forecast accuracy.
+The Wheat and morrison estimater reports a regularity of close to 1 supports the assumption of exponentially distributed
+intertransaction times, and the mle calculation of close to 1 also indicates no stronger degrees of regularity for any subset of highly
+active customers
+
+### BG-NBD Model- Retail Dataset
+```{r}
+
+# estimate BG-NBD parameters
+round(params.BGnbd <- BTYD::bgnbd.EstimateParameters(retailCBS), 3)
+#>  r     alpha       a        b 
+#>40.704  450.277    0.001 1575.336
+
+# report log-likelihood
+bgnbd.cbs.LL(params.BGnbd, retailCBS)
+#> [1] -187902.7
+
+# calculate expected future transactions for customers who've
+# had 1 to 5 transactions in first 52 weeks across 100 weeks
+est5.nbd <- bgnbd.ConditionalExpectedTransactions(params.BGnbd,T.star = 52, x = 1:5,t.x = 100,  T.cal = 52)
+for (i in 1:5) {
+cat("x =", i, ":", sprintf("%5.3f", est5.nbd[i]), "\n")
+}
+
+# x = 1 : 4.318 
+# x = 2 : 4.421 
+# x = 3 : 4.525 
+# x = 4 : 4.628 
+# x = 5 : 4.732 
+
+# predict whole customer cohort
+retailCBS$xstar.BGnbd <- bgnbd.ConditionalExpectedTransactions(params = params.BGnbd, T.star = 100,x = retailCBS$x, T.cal = retailCBS$T.cal, t.x = retailCBS$t.x)
+# compare predictions with actuals at aggregated level
+rbind(`Actuals` = c(`Holdout` = sum(retailCBS$x.star)),
+`NBD` = c(`Holdout` = round(sum(retailCBS$xstar.BGnbd))))
+
+#         Holdout
+# Actuals   62045
+# NBD       62221
+
+
+```
+
+### Pareto-NBD Model- Retail Dataset
+```{r}
+#convert to CBS format
+retailCBS <- elog2cbs(elog,T.cal = median(elog$date))
+
+# estimate Pareto/NBD parameters
+params.pnbd <- BTYD::pnbd.EstimateParameters(retailCBS)
+names(params.pnbd) <- c("r", "alpha", "s", "beta")
+round(params.pnbd, 3)
+#> r      alpha        s    beta
+#> 40.648 449.612   0.000  43.498 
+# report log-likelihood
+BTYD::pnbd.cbs.LL(params.pnbd, retailCBS)
+#> [1] -187902.7
+
+# For one, we can note, that the maximized log-likelihood of Pareto/NBD is bigger than
+# for the BG-NBD model, implying that its data fit is better. 
+
+#Plotting the  distribution of the estimated parameters
+pnbd.PlotTransactionRateHeterogeneity(params.pnbd)
+pnbd.PlotDropoutRateHeterogeneity(params.pnbd)
+
+
+# calculate expected future transactions for customers who've
+# had 1 to 5 transactions in first 12 weeks, but then remained
+# inactive for 40 weeks
+est5.pnbd <- BTYD::pnbd.ConditionalExpectedTransactions(params.pnbd,T.star = 52, x = 1:5, t.x = 12, T.cal = 52)
+for (i in 1:5) {
+  cat("x =", i, ":", sprintf("%5.3f", est5.pnbd[i]), "\n")
+}
+
+# x = 1 : 4.317 
+# x = 2 : 4.421 
+# x = 3 : 4.524 
+# x = 4 : 4.628 
+# x = 5 : 4.732 
+
+# P(alive) for customers who've had 1 to 5 transactions in first
+# 12 weeks, but then remained inactive for 40 weeks
+palive.pnbd <- BTYD::pnbd.PAlive(params.pnbd,x = 1:5, t.x = 12, T.cal = 52)
+for (i in 1:5) {
+  cat("x =", i, ":", sprintf("%5.2f %%", 100*palive.pnbd[i]), "\n")
+}
+
+# x = 1 : 99.99 % 
+# x = 2 : 99.99 % 
+# x = 3 : 99.99 % 
+# x = 4 : 99.99 % 
+# x = 5 : 99.99 % 
+
+
+
+# predict whole customer cohort
+retailCBS$xstar.pnbd <- BTYD::pnbd.ConditionalExpectedTransactions(  params = params.pnbd, T.star = 100,x = retailCBS$x, t.x = retailCBS$t.x,T.cal = retailCBS$T.cal)
+# compare predictions with actuals at aggregated level
+rbind(`Actuals` = c(`Holdout` = sum(retailCBS$x.star)),
+      `Pareto/NBD` = c(`Holdout` = round(sum(retailCBS$xstar.pnbd))))
+#    Holdout
+# Actuals      62045
+# Pareto/NBD   62226
+#gives almost similar estimates compared to BG-NBD
+
+
+````
